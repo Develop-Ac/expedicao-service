@@ -1,11 +1,18 @@
 // src/main.ts
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
-import helmet from 'helmet';
+import {
+  FastifyAdapter,
+  NestFastifyApplication,
+} from '@nestjs/platform-fastify';
+import type { FastifyReply, FastifyRequest } from 'fastify';
+import fastifyHelmet from '@fastify/helmet';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
-import * as bodyParser from 'body-parser';
 // (opcional, mas recomendado quando usa cookies/autenticação)
-import cookieParser from 'cookie-parser';
+import fastifyCookie from '@fastify/cookie';
+
+// substitui bodyParser.json/urlencoded({ limit: '25mb' })
+const BODY_LIMIT = 25 * 1024 * 1024;
 
 function parseOrigins(env?: string): (string | RegExp)[] {
   if (!env) return [];
@@ -34,43 +41,55 @@ function isAllowedOrigin(origin: string | undefined, allowed: (string | RegExp)[
 }
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
-
-  // Se estiver atrás de proxy reverso (Nginx/Traefik) e usar cookies Secure, habilite:
-  // app.set('trust proxy', 1);
-
-  app.use(cookieParser());
-
-  app.use(
-    helmet({
-      contentSecurityPolicy: false,     // necessário para swagger-ui
-      crossOriginEmbedderPolicy: false, // evita bloqueio de assets
-    }),
+  const app = await NestFactory.create<NestFastifyApplication>(
+    AppModule,
+    // O FastifyAdapter já registra @fastify/formbody (urlencoded) automaticamente.
+    new FastifyAdapter({ bodyLimit: BODY_LIMIT }),
+    { bufferLogs: true },
   );
 
-  app.use(['/docs', '/docs-json'], (req, res, next) => {
-    const authHeader = req.headers.authorization;
+  // Se estiver atrás de proxy reverso (Nginx/Traefik) e usar cookies Secure, habilite:
+  // new FastifyAdapter({ bodyLimit: BODY_LIMIT, trustProxy: 1 })
 
-    const user = 'admin';
-    const password = 'Ac@2025acesso';
+  await app.register(fastifyCookie as any);
 
-    if (!authHeader || !authHeader.startsWith('Basic ')) {
-      res.setHeader('WWW-Authenticate', 'Basic realm="Swagger"');
-      return res.status(401).send('Autenticação necessária');
-    }
-
-    const base64Credentials = authHeader.split(' ')[1];
-    const credentials = Buffer.from(base64Credentials, 'base64').toString('utf8');
-
-    const [inputUser, inputPassword] = credentials.split(':');
-
-    if (inputUser !== user || inputPassword !== password) {
-      res.setHeader('WWW-Authenticate', 'Basic realm="Swagger"');
-      return res.status(401).send('Usuário ou senha inválidos');
-    }
-
-    next();
+  await app.register(fastifyHelmet as any, {
+    contentSecurityPolicy: false,     // necessário para swagger-ui
+    crossOriginEmbedderPolicy: false, // evita bloqueio de assets
   });
+
+  const fastify = app.getHttpAdapter().getInstance();
+
+  // Basic Auth do Swagger — equivalente ao antigo app.use(['/docs', '/docs-json'], ...)
+  fastify.addHook(
+    'onRequest',
+    (req: FastifyRequest, reply: FastifyReply, done: (err?: Error) => void) => {
+      const path = (req.raw.url ?? '').split('?')[0];
+      if (!path.startsWith('/docs')) return done();
+
+      const authHeader = req.headers.authorization;
+
+      const user = 'admin';
+      const password = 'Ac@2025acesso';
+
+      if (!authHeader || !authHeader.startsWith('Basic ')) {
+        reply.header('WWW-Authenticate', 'Basic realm="Swagger"');
+        return reply.status(401).send('Autenticação necessária');
+      }
+
+      const base64Credentials = authHeader.split(' ')[1];
+      const credentials = Buffer.from(base64Credentials, 'base64').toString('utf8');
+
+      const [inputUser, inputPassword] = credentials.split(':');
+
+      if (inputUser !== user || inputPassword !== password) {
+        reply.header('WWW-Authenticate', 'Basic realm="Swagger"');
+        return reply.status(401).send('Usuário ou senha inválidos');
+      }
+
+      done();
+    },
+  );
 
   const allowedOrigins = parseOrigins(process.env.CORS_ORIGIN);
   // Ex.: CORS_ORIGIN="http://intranet.acacessorios.local,http://localhost:3000"
@@ -97,13 +116,13 @@ async function bootstrap() {
   });
 
   // Garante Vary: Origin (útil se usar origin dinâmico/função)
-  app.use((req, res, next) => {
-    res.setHeader('Vary', 'Origin');
-    next();
-  });
-
-  app.use(bodyParser.json({ limit: '25mb' }));
-  app.use(bodyParser.urlencoded({ limit: '25mb', extended: true }));
+  fastify.addHook(
+    'onRequest',
+    (_req: FastifyRequest, reply: FastifyReply, done: (err?: Error) => void) => {
+      reply.header('Vary', 'Origin');
+      done();
+    },
+  );
 
   // (opcional) prefixo global
   // app.setGlobalPrefix('api');
